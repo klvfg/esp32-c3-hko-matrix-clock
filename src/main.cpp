@@ -1,101 +1,148 @@
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <NTPClient.h>
+#include <WiFiUdp.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
 #include <SPI.h>
-#include <ArduinoJson.h>
-#include <HTTPClient.h>
+#include <FastLED.h>
 
-// Pin definitions for ESP32-C3
+// ================== CONFIG ==================
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4          // 4 modules = 32x8 matrix (change if needed)
 #define CLK_PIN   6
 #define DATA_PIN  7
 #define CS_PIN    5
-#define MAX_DEVICES 4
 
-#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define LED_PIN   8            // WS2812B RGB LED
+#define NUM_LEDS  1
 
-MD_Parola Display = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
+// ===========================================
+
+MD_Parola P = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
+CRGB leds[NUM_LEDS];
 
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000); // HKT UTC+8
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000); // Hong Kong UTC+8
 
-String ssid = "YOUR_SSID";
-String password = "YOUR_PASSWORD";
-
-String warningText = "";
-unsigned long lastWarningUpdate = 0;
+String currentWarning = "";
+uint32_t lastUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
-  Display.begin();
-  Display.setIntensity(8);
-  Display.setScrollSpacing(0);
-  Display.setTextAlignment(PA_CENTER);
+  
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  leds[0] = CRGB::Black;
+  FastLED.show();
 
-  WiFi.begin(ssid.c_str(), password.c_str());
+  P.begin();
+  P.setIntensity(8);
+  P.setTextEffect(PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  P.setSpeed(80);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConnected!");
+  Serial.println("\nWiFi Connected!");
 
   timeClient.begin();
-  updateWarnings();
+  fetchHKOWarnings();   // Initial fetch
 }
 
 void loop() {
   timeClient.update();
 
-  String timeStr = timeClient.getFormattedTime().substring(0,5); // HH:MM
-
-  if (Display.isAnimationDone()) {
-    if (warningText.length() > 0 && millis() - lastWarningUpdate > 15000) { // Scroll warning every 15s
-      Display.displayClear();
-      Display.displayScroll(warningText.c_str(), PA_LEFT, PA_SCROLL_LEFT, 80);
-    } else {
-      Display.displayClear();
-      Display.print(timeStr.c_str());
-      delay(1000);
-    }
+  // Update warnings every 5 minutes
+  if (millis() - lastUpdate > 300000 || lastUpdate == 0) {
+    fetchHKOWarnings();
+    lastUpdate = millis();
   }
-  Display.displayAnimate();
 
-  if (millis() - lastWarningUpdate > 300000) { // Update warnings every 5 minutes
-    updateWarnings();
+  String displayText = getTimeString();
+  if (currentWarning.length() > 0) {
+    displayText += "   " + currentWarning;
   }
+
+  P.print(displayText);
+
+  if (P.displayAnimate()) {
+    P.displayReset();
+  }
+
+  delay(50);
 }
 
-void updateWarnings() {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin("https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=warnsum&lang=en");
-    int httpCode = http.GET();
+String getTimeString() {
+  int h = timeClient.getHours();
+  int m = timeClient.getMinutes();
+  char buf[10];
+  sprintf(buf, "%02d:%02d", h, m);
+  return String(buf);
+}
 
-    if (httpCode == HTTP_CODE_OK) {
-      String payload = http.getString();
-      JsonDocument doc;
-      deserializeJson(doc, payload);
+void fetchHKOWarnings() {
+  if (WiFi.status() != WL_CONNECTED) return;
 
-      warningText = "";
+  HTTPClient http;
+  http.begin("https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=warnsum&lang=en");
+  
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
 
-      // Check for key warnings
-      if (doc.containsKey("WTCSGNL")) { // Tropical Cyclone
-        warningText += "TYPHON WARNING ";
-      }
-      if (doc.containsKey("WRAIN")) { // Rainstorm
-        String type = doc["WRAIN"]["type"];
-        warningText += type + " RAINSTORM WARNING ";
-      }
-      if (doc.containsKey("WHOT")) {
-        warningText += "VERY HOT ";
-      }
+    String typhoon = "";
+    String rain = "";
 
-      if (warningText.length() == 0) {
-        warningText = "NO WARNINGS";
+    // Typhoon Warning
+    if (doc.containsKey("WTCSGNL")) {
+      String code = doc["WTCSGNL"]["code"].as<String>();
+      if (code.length() > 2) {
+        typhoon = "T" + code.substring(2);
       }
     }
-    http.end();
+
+    // Rainstorm Warning
+    if (doc.containsKey("WRAIN")) {
+      String type = doc["WRAIN"]["type"].as<String>();
+      if (type == "Amber") rain = "Y.Rain";
+      else if (type == "Red") rain = "R.Rain";
+      else if (type == "Black") rain = "B.Rain";
+    }
+
+    // Priority: Typhoon first
+    if (typhoon != "") {
+      currentWarning = typhoon;
+    } else if (rain != "") {
+      currentWarning = rain;
+    } else {
+      currentWarning = "";
+    }
+
+    updateLEDIndicator(typhoon);
   }
-  lastWarningUpdate = millis();
+  http.end();
+}
+
+void updateLEDIndicator(String typhoon) {
+  if (typhoon == "T1") {
+    leds[0] = CRGB::Blue;
+  } else if (typhoon == "T3") {
+    leds[0] = CRGB::Yellow;
+  } else if (typhoon == "T8") {
+    leds[0] = CRGB::Orange;
+  } else if (typhoon == "T9" || typhoon == "T10") {
+    leds[0] = CRGB::Red;
+  } else {
+    leds[0] = CRGB::Black;
+  }
+  FastLED.show();
 }
